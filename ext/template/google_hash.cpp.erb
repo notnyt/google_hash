@@ -1067,6 +1067,7 @@ w_object(VALUE obj, struct dump_arg *arg, int limit)
           for(<%= type %>_hash_map< <%= key_type %>, <%= value_type %> <%= extra_hash_params %> >::iterator it = incoming->hash_map->begin(); it != incoming->hash_map->end(); ++it) {
             w_object(<%= convert_keys_to_ruby %>(it->first), arg, limit);
 
+            <% if value_type == "VALUE" %>
             name = rb_class_name(CLASS_OF(it->second));
             s = StringValueCStr(name);
 
@@ -1075,6 +1076,9 @@ w_object(VALUE obj, struct dump_arg *arg, int limit)
             } else {
               w_object(<%= convert_values_to_ruby %>(it->second), arg, limit);
             }
+            <% else %>
+            w_object(<%= convert_values_to_ruby %>(it->second), arg, limit);
+            <% end %>
           }
           return;
         }
