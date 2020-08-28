@@ -1,5 +1,7 @@
 require 'rubygems'
 require 'sane'
+require 'rspec'
+
 require_relative '../ext/google_hash'
 begin
   require 'spec/autorun'
@@ -118,12 +120,6 @@ describe "google_hash" do
     a['abc'].should == 'def'
   end
 
-  it "should have better namespace" do
-    pending do
-      GoogleHash::Sparse
-    end
-  end
-
   it "should disallow non numeric keys" do
     lambda { @subject['33']}.should raise_error(TypeError)
   end
@@ -237,7 +233,7 @@ describe "google_hash" do
   end
 
   it "should do bignum to doubles et al" do
-    test_big_numbers( GoogleHashDenseDoubleToDouble.new)
+    test_big_numbers(GoogleHashDenseDoubleToDouble.new)
   end
   
   it "should allow for storing true BigNum" do
@@ -259,7 +255,18 @@ describe "google_hash" do
 	  sum.should == 7
 	end
   end
-  
+
+  it "should not call Ruby #== during GC" do
+    a = GoogleHashSparseRubyToRuby.new
+    b = Object.new
+    def b.eql?(something)
+      raise "should not call this during GC!"
+    end
+    a[b] = 3
+    GC.start # used to raise...
+    a.each{|k, v| } # just in case, this really shouldn't either
+  end
+
   it "should have nice inspect" do
     a = GoogleHashSparseIntToRuby.new
     a[3] = 4
@@ -267,7 +274,7 @@ describe "google_hash" do
     a.inspect.should == "GoogleHashSparseIntToRuby {3=>4,4=>5}"
   end
   
-  it "should skip GC when native to native" do
+  it "should skip iterating during GC when native to native" do
     pending 'caring, get from gc_bench.rb'
   end
   

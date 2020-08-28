@@ -2,6 +2,7 @@ require 'mkmf'
 require 'erb'
 require 'rubygems'
 require 'sane'
+$warnflags="-w"
 
 # re-build google's lib locally...
 dir = Dir.pwd
@@ -18,8 +19,8 @@ Dir.chdir 'sparsehash-2.0.2' do
   end
 end
 
-$CFLAGS += " -I./local_installed/include "
-$CPPFLAGS += " -I./local_installed/include "
+$CFLAGS += " -I./local_installed/include -fpermissive"
+$CPPFLAGS += " -I./local_installed/include -fpermissive"
 
 puts "running from #{Dir.pwd}"
 
@@ -39,11 +40,12 @@ else
 end
 
 ruby_key =  {:convert_keys_from_ruby => "", :convert_keys_to_ruby => "", :key_type => "VALUE", :english_key_type => "ruby",
-  :extra_hash_params => ", hashrb, eqrb", :unreachable_key => "current_instance"}  # TODO unreachable -> NULL instead?
-  
+  :extra_hash_params => ", hashrb, eqrb", :unreachable_key => "(VALUE) 0", :deleted_key => "(VALUE) -1"}
+# VALUE is a 64bit pointer as far as I can tell...so using 0 OK here since they'll never be NULL in real C land
+
 int_key = {:assert_key_type => 'T_FIXNUM', :convert_keys_from_ruby => "FIX2INT",
   :convert_keys_to_ruby => "INT2FIX", :key_type => "int", :unreachable_key => "#{unreachable_int}"}
-  
+
 # "long" is useful on 64 bit...since it can handle a wider range of incoming int's
 
 long_key = {:assert_key_type => 'T_FIXNUM', :convert_keys_from_ruby => "FIX2LONG",
@@ -63,7 +65,7 @@ int_value = {:assert_value_type => 'T_FIXNUM', :convert_values_from_ruby => "FIX
   :convert_values_to_ruby => "INT2FIX", :value_type => "int"}
 long_value = {:assert_value_type => 'T_FIXNUM', :convert_values_from_ruby => "FIX2LONG",
   :convert_values_to_ruby => "LONG2FIX", :value_type => "long"}
-  
+
 bignum_as_double_value = {:assert_value_type => ['T_BIGNUM', 'T_FIXNUM'], :convert_values_from_ruby => "rb_big2dbl",
   :convert_values_to_ruby => "rb_dbl2big", :value_type => "double",
   :extra_set_code2 => "if(TYPE(to_this) == T_FIXNUM)\nto_this = rb_int2big(FIX2INT(to_this));"
@@ -78,6 +80,7 @@ for key in [ruby_key, int_key, bignum_as_double_key, long_key] do
 
       # create local variables so that the template can look cleaner
       unreachable_key = options[:unreachable_key]
+      deleted_key = options[:deleted_key] || "(#{options[:unreachable_key]}) - 1"
       convert_keys_from_ruby = options[:convert_keys_from_ruby]
       convert_keys_to_ruby = options[:convert_keys_to_ruby]
       key_type = options[:key_type]
@@ -85,7 +88,7 @@ for key in [ruby_key, int_key, bignum_as_double_key, long_key] do
       english_key_type = options[:english_key_type] || options[:key_type]
       english_value_type = options[:english_value_type] || options[:value_type]
 
-      
+
       assert_key_type = [options[:assert_key_type]].flatten[0]
       assert_key_type2 = [options[:assert_key_type]].flatten[1]
       convert_values_from_ruby = options[:convert_values_from_ruby]
@@ -94,7 +97,9 @@ for key in [ruby_key, int_key, bignum_as_double_key, long_key] do
       assert_value_type2 = [options[:assert_value_type]].flatten[1]
 
       extra_hash_params = options[:extra_hash_params]
-      
+
+      class_name = "GoogleHash#{type.capitalize + english_key_type.capitalize}To#{english_value_type.capitalize}"
+
       template = ERB.new(File.read('template/google_hash.cpp.erb'))
       descriptor = type + '_' + english_key_type + '_to_' + english_value_type;
       File.write(descriptor + '.cpp', template.result(binding))

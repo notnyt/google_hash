@@ -2,6 +2,22 @@
 #include <iostream>
 #include <google/<%= type %>_hash_map>
 #include <ruby.h>
+#include "ruby/io.h"
+#include "ruby/st.h"
+#include "ruby/util.h"
+#include <math.h>
+#ifdef HAVE_FLOAT_H
+#include <float.h>
+#endif
+#ifdef HAVE_IEEEFP_H
+#include <ieeefp.h>
+#endif
+
+#define SIZEOF_SHORT 2
+#define SIZEOF_LONG 8
+
+#include "internal.h"
+#include "ruby/defines.h"
 
 #ifdef _LIBCPP_VERSION // https://bugs.launchpad.net/libmemcached/+bug/1216521/comments/2
  #include <functional>
@@ -11,7 +27,7 @@
  using std::tr1::hash;
 #else
  // punt! older gcc's
- using __gnu_cxx::hash; 
+ using __gnu_cxx::hash;
 #endif
 
 // much code stolen shamelessly from lourens' cb gem...
@@ -25,10 +41,9 @@ using google::<%= type %>_hash_map;      // namespace where class lives by defau
 extern "C" {
 
 // some helpers
-
-<% 
+<%
  # not yet used...
-  if false   
+  if false
 %>
 struct eqstr
 {
@@ -48,38 +63,23 @@ struct eqint
 
 <% end %>
 
-
 static ID id_eql, id_hash;
 
 <% if key_type == 'double' %>
-
 struct eqdouble
-
 {
-
   bool operator()(const double &f1, const double &f2) const
-
   {
-
     return f1 == f2;
-
   }
-
 };
-
 
 extern hash<int> inthash;
-
 struct hashdouble {
-
   size_t operator ()(const double& foo) const {
-
     return inthash((int)foo);
-
   }
-
 };
-
 <% end %>
 
 <% if key_type == 'VALUE' %>
@@ -96,10 +96,22 @@ struct eqrb
     if(s1 == s2) {
       return true;
     }
-    
-    // this line from object.c's rb_eql 
-    // lookup 0.278 -> 0.26 
+    // the weird part here is that eqrb is used during iteration
+    // to iterate over the entire "hash space" and see which objects are
+    // "live" and which are "dead" in its iterator (as well as being used at insertion time)
+    //  during gc, it was calling in to a real ruby "==" for the "live" objects
+    // which, if they used any type of allocation -> segfault
+    // since we're only dealing with ruby VALUE's here, I think we're guaranteed that they can't be NULL
+    <% if type == 'dense' %>
+      if (s2 == <%= unreachable_key %> || s2 == <%= deleted_key %> || s1 == <%= unreachable_key %> || s1 == <%= deleted_key %>) {
+    <% elsif type == 'sparse' %>
+      if (s2 == <%= unreachable_key %> || s1 == <%= unreachable_key %>) {
+    <% end %>
+        return s1 == s2; // comparison with these freako keys is straight forward :)
+      }
 
+    // this line (cacheing id_eql) from object.c's rb_eql
+    // lookup 0.278 -> 0.26
     return RTEST(rb_funcall(s1, id_eql, 1, s2));
   }
 };
@@ -119,18 +131,18 @@ struct hashrb
     size_t operator()(VALUE hash_me) const
       {
            // stolen from hash.c populate -> 0.64 0.625
-        
+
            // hmm
            // use our own custom hash function for well known types
            // to avoid a function call
            // this speeds up ints 29/44
            // and speeds up string 26/22
-           // though I suppose we could 
-           
+           // though I suppose we could
+
             switch (TYPE(hash_me)) {
               // ltodo does this help?
               // if so more types?
-              case T_FIXNUM:              
+              case T_FIXNUM:
               case T_FLOAT:
               case T_SYMBOL:
                // ltodo
@@ -143,10 +155,10 @@ struct hashrb
 	             //return H(StringValueCStr(hash_me)); // populate/lookup 0.26 -> 0.23 [core is 0.16 somehow]
 	             // perhaps they cache?
 	             //return H(RSTRING_PTR(hash_me)); // 0.23 -> -.22
-	   }        
-           
+	   }
+
             VALUE hval = rb_funcall(hash_me, id_hash, 0);
-            
+
             retry:
             switch (TYPE(hval)) {
               case T_FIXNUM:
@@ -169,15 +181,15 @@ typedef struct {
 
 static void mark_hash_map_values(RCallback *incoming) {
   <% if value_type == 'VALUE' || key_type == 'VALUE' %>
-    
+
     // only need to iterate if we store *real* Ruby values
-    
+
     for(<%= type %>_hash_map< <%= key_type %>, <%= value_type %> <%= extra_hash_params %> >::iterator it = incoming->hash_map->begin(); it != incoming->hash_map->end(); ++it) {
-     
+
      <% if value_type == 'VALUE' %>
        rb_gc_mark(it->second);
      <% end %>
-     
+
      <% if key_type == 'VALUE' %>
        rb_gc_mark(it->first);
      <% end %>
@@ -194,17 +206,17 @@ callback_alloc( VALUE klass )
 {
     RCallback* cbs;
     VALUE current_instance = Data_Make_Struct(klass, RCallback, mark_hash_map_values, free_hash_callback, cbs); // XXXX the last parameter is just a pointer? huh?
-    
+
     cbs->hash_map = new <%= type %>_hash_map< <%= key_type %>, <%= value_type %> <%= extra_hash_params %> >();
-    <% if type == 'dense' %> 
+    <% if type == 'dense' %>
       // needs both empty key and deleted keys [and different] for deletes...
       cbs->hash_map->set_empty_key(<%= unreachable_key %>);
-      // in th eory could also call set_deleted_key "anytime" ...
-      cbs->hash_map->set_deleted_key((<%= unreachable_key %>)-1); // hope this is also typically unreachable from ruby land [?]
-    <% elsif type == 'sparse' %> 
+      // in theory could also call set_deleted_key "anytime" ... but why not do it now
+      cbs->hash_map->set_deleted_key(<%= deleted_key %>);
+    <% elsif type == 'sparse' %>
        cbs->hash_map->set_deleted_key(<%= unreachable_key %>);
     <% end %>
-	
+
     return current_instance;
 }
 
@@ -226,7 +238,7 @@ static VALUE rb_ghash_set(VALUE cb, VALUE set_this, VALUE to_this) {
          rb_raise(rb_eTypeError, "not valid key (expected <%= assert_key_type %>)");
     }
   <% end %>
-  
+
   <% if assert_value_type %>
     if(!(TYPE(to_this) == <%= assert_value_type %>)) {
       <%= "if(!(TYPE(to_this) == #{assert_value_type2}))" if assert_value_type2 %>
@@ -235,11 +247,11 @@ static VALUE rb_ghash_set(VALUE cb, VALUE set_this, VALUE to_this) {
   <% end %>
 
   <%= options[:extra_set_code] %>
-  
+
   <%= options[:extra_set_code2] %>
-  
+
   RCallback* cbs = GetCallbackStruct(cb);
-  (*cbs->hash_map)[ <%= convert_keys_from_ruby %>(set_this)] = <%= convert_values_from_ruby %>(to_this);  
+  (*cbs->hash_map)[ <%= convert_keys_from_ruby %>(set_this)] = <%= convert_values_from_ruby %>(to_this);
   return to_this; // ltodo test that it returns value...
 }
 
@@ -253,9 +265,9 @@ static VALUE rb_ghash_get(VALUE cb, VALUE get_this, int just_check_for_presence,
     }
   <% end %>
   RCallback* cbs = GetCallbackStruct(cb);
-  
+
   <%= type %>_hash_map< <%= key_type %>, <%= value_type %> <%= extra_hash_params %> >::iterator out = cbs->hash_map->find(<%= convert_keys_from_ruby %>(get_this));
-  
+
   if(out == cbs->hash_map->end()) { // key not found in hashmap
     if(just_check_for_presence)
       return Qfalse;
@@ -275,7 +287,7 @@ static VALUE rb_ghash_get(VALUE cb, VALUE get_this, int just_check_for_presence,
 	  return out2;
 	}
   }
-  
+
 }
 
 static VALUE rb_ghash_get_value(VALUE cb, VALUE get_this) {
@@ -295,6 +307,1035 @@ static VALUE rb_ghash_size(VALUE cb) {
   return INT2FIX(incoming->hash_map->size());
 }
 
+#define MARSHAL_INFECTION FL_TAINT
+
+struct dump_arg {
+    VALUE str, dest;
+    st_table *symbols;
+    st_table *data;
+    st_table *compat_tbl;
+    st_table *encodings;
+    int infection;
+};
+
+struct dump_call_arg {
+    VALUE obj;
+    struct dump_arg *arg;
+    int limit;
+};
+
+static void w_long(long, struct dump_arg*);
+static void w_encoding(VALUE encname, struct dump_call_arg *arg);
+static VALUE encoding_name(VALUE obj, struct dump_arg *arg);
+
+static void clear_dump_arg(struct dump_arg *arg);
+
+static void
+mark_dump_arg(void *ptr)
+{
+    struct dump_arg *p = ptr;
+    if (!p->symbols)
+        return;
+    rb_mark_set(p->symbols);
+    rb_mark_set(p->data);
+    rb_mark_hash(p->compat_tbl);
+    rb_gc_mark(p->str);
+}
+
+static void
+clear_dump_arg(struct dump_arg *arg)
+{
+    if (!arg->symbols) return;
+    st_free_table(arg->symbols);
+    arg->symbols = 0;
+    st_free_table(arg->data);
+    arg->data = 0;
+    if (arg->compat_tbl) {
+        st_free_table(arg->compat_tbl);
+        arg->compat_tbl = 0;
+    }
+    if (arg->encodings) {
+        st_free_table(arg->encodings);
+        arg->encodings = 0;
+    }
+}
+
+
+static void
+free_dump_arg(void *ptr)
+{
+    clear_dump_arg(ptr);
+    xfree(ptr);
+}
+
+static size_t
+memsize_dump_arg(const void *ptr)
+{
+    return sizeof(struct dump_arg);
+}
+
+static const rb_data_type_t dump_arg_data = {
+    "dump_arg",
+    {mark_dump_arg, free_dump_arg, memsize_dump_arg,},
+    0, 0, RUBY_TYPED_FREE_IMMEDIATELY
+};
+
+static VALUE
+must_not_be_anonymous(const char *type, VALUE path)                                       {
+    char *n = RSTRING_PTR(path);
+
+    if (!rb_enc_asciicompat(rb_enc_get(path))) {
+        /* cannot occur? */
+        rb_raise(rb_eTypeError, "can't dump non-ascii %s name % "PRIsVALUE,
+                 type, path);
+    }
+    if (n[0] == '#') {
+        rb_raise(rb_eTypeError, "can't dump anonymous %s % "PRIsVALUE,                                     type, path);
+    }
+    return path;
+}
+
+
+static st_index_t rb_ident_hash(st_data_t n);
+
+
+static void w_object(VALUE,struct dump_arg*,int);
+#define BITSPERSHORT (2*CHAR_BIT)
+#define SHORTMASK ((1<<BITSPERSHORT)-1)
+#define SHORTDN(x) RSHIFT((x),BITSPERSHORT)
+
+#if SIZEOF_SHORT == SIZEOF_BDIGIT
+#define SHORTLEN(x) (x)
+#else
+static size_t
+shortlen(size_t len, BDIGIT *ds)
+{
+    BDIGIT num;
+    int offset = 0;
+
+    num = ds[len-1];
+    while (num) {
+        num = SHORTDN(num);
+        offset++;
+    }
+    return (len - 1)*SIZEOF_BDIGIT/2 + offset;
+}
+#define SHORTLEN(x) shortlen((x),d)
+#endif
+
+#define MARSHAL_MAJOR   4
+#define MARSHAL_MINOR   8
+#define TYPE_NIL        '0'
+#define TYPE_TRUE       'T'
+#define TYPE_FALSE      'F'
+#define TYPE_FIXNUM     'i'
+
+#define TYPE_EXTENDED   'e'
+#define TYPE_UCLASS     'C'
+#define TYPE_OBJECT     'o'
+#define TYPE_DATA       'd'
+#define TYPE_USERDEF    'u'
+#define TYPE_USRMARSHAL 'U'
+#define TYPE_FLOAT      'f'
+#define TYPE_BIGNUM     'l'
+#define TYPE_STRING     '"'
+#define TYPE_REGEXP     '/'
+#define TYPE_ARRAY      '['
+#define TYPE_HASH       '{'
+#define TYPE_HASH_DEF   '}'
+#define TYPE_STRUCT     'S'
+#define TYPE_MODULE_OLD 'M'
+#define TYPE_CLASS      'c'
+#define TYPE_MODULE     'm'
+
+#define TYPE_SYMBOL     ':'
+#define TYPE_SYMLINK    ';'
+
+#define TYPE_IVAR       'I'
+#define TYPE_LINK       '@'
+
+static ID s_dump, s_load, s_mdump, s_mload;
+static ID s_dump_data, s_load_data, s_alloc, s_call;
+static ID s_getbyte, s_read, s_write, s_binmode;
+
+typedef struct {
+    VALUE newclass;
+    VALUE oldclass;
+    VALUE (*dumper)(VALUE);
+    VALUE (*loader)(VALUE, VALUE);
+} marshal_compat_t;
+
+static st_table *compat_allocator_tbl;
+static VALUE compat_allocator_tbl_wrapper;
+static VALUE rb_marshal_dump_limited(VALUE obj, VALUE port, int limit);
+static VALUE rb_marshal_load_with_proc(VALUE port, VALUE proc);
+
+
+#define name_s_dump     "_dump"
+#define name_s_load     "_load"
+#define name_s_mdump    "marshal_dump"
+#define name_s_mload    "marshal_load"
+#define name_s_dump_data "_dump_data"
+#define name_s_load_data "_load_data"
+#define name_s_alloc    "_alloc"
+#define name_s_call     "call"
+#define name_s_getbyte  "getbyte"
+#define name_s_read     "read"
+#define name_s_write    "write"
+#define name_s_binmode  "binmode"
+
+#ifdef DBL_MANT_DIG
+#define DECIMAL_MANT (53-16)    /* from IEEE754 double precision */
+
+#if DBL_MANT_DIG > 32
+#define MANT_BITS 32
+#elif DBL_MANT_DIG > 24
+#define MANT_BITS 24
+#elif DBL_MANT_DIG > 16
+#define MANT_BITS 16
+#else
+#define MANT_BITS 8
+#endif
+
+static double
+load_mantissa(double d, const char *buf, long len)
+{
+    if (!len) return d;
+    if (--len > 0 && !*buf++) { /* binary mantissa mark */
+        int e, s = d < 0, dig = 0;
+        unsigned long m;
+
+        modf(ldexp(frexp(fabs(d), &e), DECIMAL_MANT), &d);
+        do {
+            m = 0;
+            switch (len) {
+              default: m = *buf++ & 0xff;
+#if MANT_BITS > 24
+              case 3: m = (m << 8) | (*buf++ & 0xff);
+#endif
+#if MANT_BITS > 16
+              case 2: m = (m << 8) | (*buf++ & 0xff);
+#endif
+#if MANT_BITS > 8
+              case 1: m = (m << 8) | (*buf++ & 0xff);
+#endif
+            }
+            dig -= len < MANT_BITS / 8 ? 8 * (unsigned)len : MANT_BITS;
+            d += ldexp((double)m, dig);
+        } while ((len -= MANT_BITS / 8) > 0);
+        d = ldexp(d, e - DECIMAL_MANT);
+        if (s) d = -d;
+    }
+    return d;
+}
+#else
+#define load_mantissa(d, buf, len) (d)
+#endif
+
+#define set_id(sym) sym = rb_intern_const(name_##sym)
+#define dump_funcall(arg, obj, sym, argc, argv) \
+    check_userdump_arg(obj, sym, argc, argv, arg, name_##sym)
+#define dump_check_funcall(arg, obj, sym, argc, argv) \
+    check_dump_arg(rb_check_funcall(obj, sym, argc, argv), arg, name_##sym)
+static VALUE
+check_dump_arg(VALUE ret, struct dump_arg *arg, const char *name)
+{
+    if (!arg->symbols) {
+        rb_raise(rb_eRuntimeError, "Marshal.dump reentered at %s",
+                 name);
+    }
+    return ret;
+}
+
+
+static VALUE
+check_userdump_arg(VALUE obj, ID sym, int argc, const VALUE *argv,
+                   struct dump_arg *arg, const char *name)
+{
+    VALUE ret = rb_funcallv(obj, sym, argc, argv);                                            VALUE klass = CLASS_OF(obj);
+    if (CLASS_OF(ret) == klass) {
+        rb_raise(rb_eRuntimeError, "%"PRIsVALUE"#%s returned same class instance",
+                 klass, name);
+    }
+    return check_dump_arg(ret, arg, name);
+}
+
+static void
+w_nbyte(const char *s, long n, struct dump_arg *arg)
+{
+    VALUE buf = arg->str;
+    rb_str_buf_cat(buf, s, n);
+    RBASIC(buf)->flags |= arg->infection;
+    if (arg->dest && RSTRING_LEN(buf) >= BUFSIZ) {
+        rb_io_write(arg->dest, buf);
+        rb_str_resize(buf, 0);
+    }
+}
+
+static void
+w_byte(char c, struct dump_arg *arg)
+{
+    w_nbyte(&c, 1, arg);
+}
+
+static void
+w_bytes(const char *s, long n, struct dump_arg *arg)
+{
+    w_long(n, arg);
+    w_nbyte(s, n, arg);
+}
+
+
+static void
+w_symbol(VALUE sym, struct dump_arg *arg)
+{
+    st_data_t num;
+    VALUE encname;
+
+    if (st_lookup(arg->symbols, sym, &num)) {
+        w_byte(TYPE_SYMLINK, arg);
+        w_long((long)num, arg);
+    }
+    else {
+        const VALUE orig_sym = sym;
+        sym = rb_sym2str(sym);
+        if (!sym) {
+            rb_raise(rb_eTypeError, "can't dump anonymous ID %"PRIdVALUE, sym);
+        }
+        encname = encoding_name(sym, arg);
+        if (NIL_P(encname) ||
+            rb_enc_str_coderange(sym) == ENC_CODERANGE_7BIT) {
+            encname = Qnil;
+        }
+        else {
+            w_byte(TYPE_IVAR, arg);
+        }
+        w_byte(TYPE_SYMBOL, arg);
+        w_bytes(RSTRING_PTR(sym), RSTRING_LEN(sym), arg);
+        st_add_direct(arg->symbols, orig_sym, arg->symbols->num_entries);
+        if (!NIL_P(encname)) {
+            struct dump_call_arg c_arg;
+            c_arg.limit = 1;
+            c_arg.arg = arg;
+            w_long(1L, arg);
+            w_encoding(encname, &c_arg);
+        }
+    }
+}
+
+static ID id_encoding;
+
+
+#define w_cstr(s, arg) w_bytes((s), strlen(s), (arg))
+
+static VALUE
+encoding_name(VALUE obj, struct dump_arg *arg)
+{
+    int encidx = rb_enc_get_index(obj);
+    rb_encoding *enc = 0;
+    st_data_t name;
+
+    if (encidx <= 0 || !(enc = rb_enc_from_index(encidx))) {
+        return Qnil;
+    }
+
+    /* special treatment for US-ASCII and UTF-8 */
+    if (encidx == rb_usascii_encindex()) {
+        return Qfalse;
+    }
+    else if (encidx == rb_utf8_encindex()) {
+        return Qtrue;
+    }
+
+    if (arg->encodings ?
+        !st_lookup(arg->encodings, (st_data_t)rb_enc_name(enc), &name) :
+        (arg->encodings = st_init_strcasetable(), 1)) {
+        name = (st_data_t)rb_str_new_cstr(rb_enc_name(enc));
+        st_insert(arg->encodings, (st_data_t)rb_enc_name(enc), name);
+    }
+    return (VALUE)name;
+}
+
+static void
+w_unique(VALUE s, struct dump_arg *arg)
+{
+    must_not_be_anonymous("class", s);
+    w_symbol(rb_str_intern(s), arg);
+}
+
+static void
+w_encoding(VALUE encname, struct dump_call_arg *arg)
+{
+    int limit = arg->limit;
+    if (limit >= 0) ++limit;
+    switch (encname) {
+      case Qfalse:
+      case Qtrue:
+        w_symbol(ID2SYM(rb_intern("E")), arg->arg);
+        w_object(encname, arg->arg, limit);
+      case Qnil:
+        return;
+    }
+    w_symbol(ID2SYM(rb_id_encoding()), arg->arg);
+    w_object(encname, arg->arg, limit);
+}
+
+size_t rb_id_table_size(const struct rb_id_table *tbl);
+
+static VALUE
+class2path(VALUE klass)
+{
+    VALUE path = rb_class_path(klass);
+
+    must_not_be_anonymous((RB_TYPE_P(klass, T_CLASS) ? "class" : "module"), path);
+    if (rb_path_to_class(path) != rb_class_real(klass)) {
+        rb_raise(rb_eTypeError, "% "PRIsVALUE" can't be referred to", path);
+    }
+    return path;
+}
+
+#define SINGLETON_DUMP_UNABLE_P(klass) \
+    (rb_id_table_size(RCLASS_M_TBL(klass)) > 0 || \
+     (RCLASS_IV_TBL(klass) && RCLASS_IV_TBL(klass)->num_entries > 1))
+
+static void
+w_extended(VALUE klass, struct dump_arg *arg, int check)
+{
+    if (check && FL_TEST(klass, FL_SINGLETON)) {
+        VALUE origin = RCLASS_ORIGIN(klass);
+        if (SINGLETON_DUMP_UNABLE_P(klass) ||
+            (origin != klass && SINGLETON_DUMP_UNABLE_P(origin))) {
+            rb_raise(rb_eTypeError, "singleton can't be dumped");
+        }
+        klass = RCLASS_SUPER(klass);
+    }
+    while (BUILTIN_TYPE(klass) == T_ICLASS) {
+        VALUE path = rb_class_name(RBASIC(klass)->klass);
+        w_byte(TYPE_EXTENDED, arg);
+        w_unique(path, arg);
+        klass = RCLASS_SUPER(klass);
+    }
+}
+
+
+static void
+w_class(char type, VALUE obj, struct dump_arg *arg, int check)
+{
+    VALUE path;
+    st_data_t real_obj;
+    VALUE klass;
+
+    if (arg->compat_tbl &&
+                st_lookup(arg->compat_tbl, (st_data_t)obj, &real_obj)) {
+        obj = (VALUE)real_obj;
+    }
+    klass = CLASS_OF(obj);
+    w_extended(klass, arg, check);
+    w_byte(type, arg);
+    path = class2path(rb_class_real(klass));
+    w_unique(path, arg);
+}
+
+
+NORETURN(static inline void io_needed(void));
+static inline void
+io_needed(void)
+{
+    rb_raise(rb_eTypeError, "instance of IO needed");
+}
+
+static int
+hash_each(VALUE key, VALUE value, struct dump_call_arg *arg)
+{
+    w_object(key, arg->arg, arg->limit);
+    w_object(value, arg->arg, arg->limit);
+    return ST_CONTINUE;
+}
+
+#define to_be_skipped_id(id) (id == rb_id_encoding() || id == rb_intern("E") || !rb_id2str(id))
+
+
+static int
+obj_count_ivars(st_data_t key, st_data_t val, st_data_t a)
+{
+    ID id = (ID)key;
+    if (!to_be_skipped_id(id)) ++*(st_index_t *)a;
+    return ST_CONTINUE;
+}
+
+
+
+struct w_ivar_arg {
+    struct dump_call_arg *dump;
+    st_data_t num_ivar;
+};
+static st_index_t
+has_ivars(VALUE obj, VALUE encname, VALUE *ivobj)
+{
+    st_index_t enc = !NIL_P(encname);
+    st_index_t num = 0;
+
+    if (SPECIAL_CONST_P(obj)) goto generic;
+    switch (BUILTIN_TYPE(obj)) {
+      case T_OBJECT:
+      case T_CLASS:
+      case T_MODULE:
+        break; /* counted elsewhere */
+      default:
+      generic:
+        rb_ivar_foreach(obj, obj_count_ivars, (st_data_t)&num);
+        if (num) *ivobj = obj;
+    }
+
+    return num + enc;
+}
+
+static void
+w_short(int x, struct dump_arg *arg)
+{
+    w_byte((char)((x >> 0) & 0xff), arg);
+    w_byte((char)((x >> 8) & 0xff), arg);
+}
+
+static void
+w_uclass(VALUE obj, VALUE super, struct dump_arg *arg)
+{
+    VALUE klass = CLASS_OF(obj);
+
+    w_extended(klass, arg, TRUE);
+    klass = rb_class_real(klass);
+    if (klass != super) {
+        w_byte(TYPE_UCLASS, arg);
+        w_unique(class2path(klass), arg);
+    }
+}
+
+static int
+w_obj_each(st_data_t key, st_data_t val, st_data_t a)
+{
+    ID id = (ID)key;
+    VALUE value = (VALUE)val;
+    struct w_ivar_arg *ivarg = (struct w_ivar_arg *)a;
+    struct dump_call_arg *arg = ivarg->dump;
+
+    if (to_be_skipped_id(id)) return ST_CONTINUE;
+    if (!ivarg->num_ivar) {
+        rb_raise(rb_eRuntimeError, "instance variable added to %"PRIsVALUE" instance",
+                 CLASS_OF(arg->obj));
+    }
+    --ivarg->num_ivar;
+    w_symbol(ID2SYM(id), arg->arg);
+    w_object(value, arg->arg, arg->limit);
+    return ST_CONTINUE;
+}
+
+
+static void
+w_ivar_each(VALUE obj, st_index_t num, struct dump_call_arg *arg)
+{
+    struct w_ivar_arg ivarg = {arg, num};
+    if (!num) return;
+    rb_ivar_foreach(obj, w_obj_each, (st_data_t)&ivarg);
+}
+
+static void
+w_ivar(st_index_t num, VALUE ivobj, VALUE encname, struct dump_call_arg *arg)
+{
+    w_long(num, arg->arg);
+    w_encoding(encname, arg);
+    if (ivobj != Qundef) {
+        w_ivar_each(ivobj, num, arg);
+    }
+}
+
+static void
+w_objivar(VALUE obj, struct dump_call_arg *arg)
+{
+    st_data_t num = 0;
+
+    rb_ivar_foreach(obj, obj_count_ivars, (st_data_t)&num);
+    w_long(num, arg->arg);
+    w_ivar_each(obj, num, arg);
+}
+
+
+
+#ifdef DBL_DIG
+#define FLOAT_DIG (DBL_DIG+2)
+#else
+#define FLOAT_DIG 17
+#endif
+
+static void
+w_float(double d, struct dump_arg *arg)
+{
+    char buf[FLOAT_DIG + (DECIMAL_MANT + 7) / 8 + 10];
+
+    if (isinf(d)) {
+        if (d < 0) w_cstr("-inf", arg);
+        else       w_cstr("inf", arg);
+    }
+    else if (isnan(d)) {
+        w_cstr("nan", arg);
+    }
+    else if (d == 0.0) {
+        if (1.0/d < 0) w_cstr("-0", arg);
+        else           w_cstr("0", arg);
+    }
+    else {
+        int decpt, sign, digs, len = 0;
+        char *e, *p = ruby_dtoa(d, 0, 0, &decpt, &sign, &e);
+        if (sign) buf[len++] = '-';
+        digs = (int)(e - p);
+        if (decpt < -3 || decpt > digs) {
+            buf[len++] = p[0];
+            if (--digs > 0) buf[len++] = '.';
+            memcpy(buf + len, p + 1, digs);
+            len += digs;
+            len += snprintf(buf + len, sizeof(buf) - len, "e%d", decpt - 1);
+        }
+        else if (decpt > 0) {
+            memcpy(buf + len, p, decpt);
+            len += decpt;
+            if ((digs -= decpt) > 0) {
+                buf[len++] = '.';
+                memcpy(buf + len, p + decpt, digs);
+                len += digs;
+            }
+        }
+        else {
+          buf[len++] = '0';
+          buf[len++] = '.';
+          if (decpt) {
+              memset(buf + len, '0', -decpt);
+              len -= decpt;
+          }
+          memcpy(buf + len, p, digs);
+          len += digs;
+      }
+      xfree(p);
+      w_bytes(buf, len, arg);
+  }
+}
+static void
+w_long(long x, struct dump_arg *arg)
+{
+    char buf[sizeof(long)+1];
+    int i;
+
+#if SIZEOF_LONG > 4
+    if (!(RSHIFT(x, 31) == 0 || RSHIFT(x, 31) == -1)) {
+        /* big long does not fit in 4 bytes */
+        rb_raise(rb_eTypeError, "long too big to dump");
+    }
+#endif
+
+    if (x == 0) {
+        w_byte(0, arg);
+        return;
+    }
+    if (0 < x && x < 123) {
+        w_byte((char)(x + 5), arg);
+        return;
+    }
+    if (-124 < x && x < 0) {
+        w_byte((char)((x - 5)&0xff), arg);
+        return;
+    }
+    for (i=1;i<(int)sizeof(long)+1;i++) {
+        buf[i] = (char)(x & 0xff);
+        x = RSHIFT(x,8);
+        if (x == 0) {
+            buf[0] = i;
+            break;
+        }
+        if (x == -1) {
+            buf[0] = -i;
+            break;
+        }
+    }
+    w_nbyte(buf, i+1, arg);
+}
+static int
+mark_marshal_compat_i(st_data_t key, st_data_t value)
+{
+    marshal_compat_t *p = (marshal_compat_t *)value;
+    rb_gc_mark(p->newclass);
+    rb_gc_mark(p->oldclass);
+    return ST_CONTINUE;
+}
+
+static void
+mark_marshal_compat_t(void *tbl)
+{
+    if (!tbl) return;
+    st_foreach(tbl, mark_marshal_compat_i, 0);
+}
+
+static st_table *
+compat_allocator_table(void)
+{
+    if (compat_allocator_tbl) return compat_allocator_tbl;
+    compat_allocator_tbl = st_init_numtable();
+#undef RUBY_UNTYPED_DATA_WARNING
+#define RUBY_UNTYPED_DATA_WARNING 0
+    compat_allocator_tbl_wrapper =
+    Data_Wrap_Struct(0, mark_marshal_compat_t, 0, compat_allocator_tbl);
+    rb_gc_register_mark_object(compat_allocator_tbl_wrapper);
+    return compat_allocator_tbl;
+}
+
+static void
+w_object(VALUE obj, struct dump_arg *arg, int limit)
+{
+    struct dump_call_arg c_arg;
+    VALUE ivobj = Qundef;
+    st_data_t num;
+    st_index_t hasiv = 0;
+    VALUE encname = Qnil;
+
+    if (limit == 0) {
+        rb_raise(rb_eArgError, "exceed depth limit");
+    }
+
+    if (limit > 0) limit--;
+    c_arg.limit = limit;
+    c_arg.arg = arg;
+    c_arg.obj = obj;
+
+    if (st_lookup(arg->data, obj, &num)) {
+        w_byte(TYPE_LINK, arg);
+        w_long((long)num, arg);
+        return;
+    }
+    if (obj == Qnil) {
+        w_byte(TYPE_NIL, arg);
+    }
+    else if (obj == Qtrue) {
+        w_byte(TYPE_TRUE, arg);
+    }
+    else if (obj == Qfalse) {
+        w_byte(TYPE_FALSE, arg);
+    }
+    else if (FIXNUM_P(obj)) {
+#if SIZEOF_LONG <= 4
+        w_byte(TYPE_FIXNUM, arg);
+        w_long(FIX2INT(obj), arg);
+#else
+        if (RSHIFT((long)obj, 31) == 0 || RSHIFT((long)obj, 31) == -1) {
+            w_byte(TYPE_FIXNUM, arg);
+            w_long(FIX2LONG(obj), arg);
+        }
+        else {
+            w_object(rb_int2big(FIX2LONG(obj)), arg, limit);
+        }
+#endif
+    }
+    else if (SYMBOL_P(obj)) {
+        w_symbol(obj, arg);
+    }
+    else if (FLONUM_P(obj)) {
+        st_add_direct(arg->data, obj, arg->data->num_entries);
+        w_byte(TYPE_FLOAT, arg);
+        w_float(RFLOAT_VALUE(obj), arg);
+    }
+    else {
+        VALUE v;
+
+        if (!RBASIC_CLASS(obj)) {
+            rb_raise(rb_eTypeError, "can't dump internal %s",
+                     rb_builtin_type_name(BUILTIN_TYPE(obj)));
+        }
+
+        arg->infection |= (int)FL_TEST(obj, MARSHAL_INFECTION);
+
+        VALUE name = rb_class_name(CLASS_OF(obj));
+        char *s = StringValueCStr(name);
+
+        if(strncmp("GoogleHash", s, 10) == 0)
+        {
+          RCallback *incoming = GetCallbackStruct(obj);
+          long size = incoming->hash_map->size();
+
+          w_byte(TYPE_HASH, arg);
+          w_long(size, arg);
+
+          st_add_direct(arg->data, obj, arg->data->num_entries);
+
+          if (size == 0) return;
+
+          for(<%= type %>_hash_map< <%= key_type %>, <%= value_type %> <%= extra_hash_params %> >::iterator it = incoming->hash_map->begin(); it != incoming->hash_map->end(); ++it) {
+            w_object(<%= convert_keys_to_ruby %>(it->first), arg, limit);
+
+            name = rb_class_name(CLASS_OF(it->second));
+            s = StringValueCStr(name);
+
+            if(strncmp("GoogleHash", s, 10) == 0) {
+              rb_funcall(<%= convert_values_to_ruby %>(it->second), rb_intern("dump_obj"), 2, arg, limit);
+            } else {
+              w_object(<%= convert_values_to_ruby %>(it->second), arg, limit);
+            }
+          }
+          return;
+        }
+
+
+        if (rb_obj_respond_to(obj, s_mdump, TRUE)) {
+            st_add_direct(arg->data, obj, arg->data->num_entries);
+
+            v = dump_funcall(arg, obj, s_mdump, 0, 0);
+            w_class(TYPE_USRMARSHAL, obj, arg, FALSE);
+            w_object(v, arg, limit);
+            return;
+        }
+        if (rb_obj_respond_to(obj, s_dump, TRUE)) {
+            VALUE ivobj2 = Qundef;
+            st_index_t hasiv2;
+            VALUE encname2;
+
+            v = INT2NUM(limit);
+            v = dump_funcall(arg, obj, s_dump, 1, &v);
+            if (!RB_TYPE_P(v, T_STRING)) {
+                rb_raise(rb_eTypeError, "_dump() must return string");
+            }
+            hasiv = has_ivars(obj, (encname = encoding_name(obj, arg)), &ivobj);
+            hasiv2 = has_ivars(v, (encname2 = encoding_name(v, arg)), &ivobj2);
+            if (hasiv2) {
+                hasiv = hasiv2;
+                ivobj = ivobj2;
+                encname = encname2;
+            }
+            if (hasiv) w_byte(TYPE_IVAR, arg);
+            w_class(TYPE_USERDEF, obj, arg, FALSE);
+            w_bytes(RSTRING_PTR(v), RSTRING_LEN(v), arg);
+            if (hasiv) {
+                w_ivar(hasiv, ivobj, encname, &c_arg);
+            }
+            st_add_direct(arg->data, obj, arg->data->num_entries);
+            return;
+        }
+
+        st_add_direct(arg->data, obj, arg->data->num_entries);
+
+        hasiv = has_ivars(obj, (encname = encoding_name(obj, arg)), &ivobj);
+        {
+            st_data_t compat_data;
+            rb_alloc_func_t allocator = rb_get_alloc_func(RBASIC(obj)->klass);
+            if (st_lookup(compat_allocator_table(),
+                          (st_data_t)allocator,
+                          &compat_data)) {
+                marshal_compat_t *compat = (marshal_compat_t*)compat_data;
+                VALUE real_obj = obj;
+                obj = compat->dumper(real_obj);
+                if (!arg->compat_tbl) {
+                    arg->compat_tbl = rb_init_identtable();
+                }
+                st_insert(arg->compat_tbl, (st_data_t)obj, (st_data_t)real_obj);
+                if (obj != real_obj && ivobj == Qundef) hasiv = 0;
+            }
+        }
+        if (hasiv) w_byte(TYPE_IVAR, arg);
+
+        switch (BUILTIN_TYPE(obj)) {
+          case T_CLASS:
+            if (FL_TEST(obj, FL_SINGLETON)) {
+                rb_raise(rb_eTypeError, "singleton class can't be dumped");
+            }
+            w_byte(TYPE_CLASS, arg);
+            {
+                VALUE path = class2path(obj);
+                w_bytes(RSTRING_PTR(path), RSTRING_LEN(path), arg);
+                RB_GC_GUARD(path);
+            }
+            break;
+
+          case T_MODULE:
+            w_byte(TYPE_MODULE, arg);
+            {
+                VALUE path = class2path(obj);
+                w_bytes(RSTRING_PTR(path), RSTRING_LEN(path), arg);
+                RB_GC_GUARD(path);
+            }
+            break;
+
+          case T_FLOAT:
+            w_byte(TYPE_FLOAT, arg);
+            w_float(RFLOAT_VALUE(obj), arg);
+            break;
+
+          case T_BIGNUM:
+            w_byte(TYPE_BIGNUM, arg);
+            {
+                char sign = BIGNUM_SIGN(obj) ? '+' : '-';
+                size_t len = BIGNUM_LEN(obj);
+                size_t slen;
+                BDIGIT *d = BIGNUM_DIGITS(obj);
+
+                slen = SHORTLEN(len);
+                if (LONG_MAX < slen) {
+                    rb_raise(rb_eTypeError, "too big Bignum can't be dumped");
+                }
+
+                w_byte(sign, arg);
+                w_long((long)slen, arg);
+                while (len--) {
+#if SIZEOF_BDIGIT > SIZEOF_SHORT
+                    BDIGIT num = *d;
+                    int i;
+
+                    for (i=0; i<SIZEOF_BDIGIT; i+=SIZEOF_SHORT) {
+                        w_short(num & SHORTMASK, arg);
+                        num = SHORTDN(num);
+                        if (len == 0 && num == 0) break;
+                    }
+#else
+                    w_short(*d, arg);
+#endif
+                    d++;
+                }
+            }
+            break;
+
+          case T_STRING:
+            w_uclass(obj, rb_cString, arg);
+            w_byte(TYPE_STRING, arg);
+            w_bytes(RSTRING_PTR(obj), RSTRING_LEN(obj), arg);
+            break;
+
+          case T_REGEXP:
+            w_uclass(obj, rb_cRegexp, arg);
+            w_byte(TYPE_REGEXP, arg);
+            {
+                int opts = rb_reg_options(obj);
+                w_bytes(RREGEXP_SRC_PTR(obj), RREGEXP_SRC_LEN(obj), arg);
+                w_byte((char)opts, arg);
+            }
+            break;
+
+          case T_ARRAY:
+            w_uclass(obj, rb_cArray, arg);
+            w_byte(TYPE_ARRAY, arg);
+            {
+                long i, len = RARRAY_LEN(obj);
+
+                w_long(len, arg);
+                for (i=0; i<RARRAY_LEN(obj); i++) {
+                    w_object(RARRAY_AREF(obj, i), arg, limit);
+                    if (len != RARRAY_LEN(obj)) {
+                        rb_raise(rb_eRuntimeError, "array modified during dump");
+                    }
+                }
+            }
+            break;
+
+          case T_HASH:
+            w_uclass(obj, rb_cHash, arg);
+            if (NIL_P(RHASH_IFNONE(obj))) {
+                w_byte(TYPE_HASH, arg);
+            }
+            else if (FL_TEST(obj, HASH_PROC_DEFAULT)) {
+                rb_raise(rb_eTypeError, "can't dump hash with default proc");
+            }
+            else {
+                w_byte(TYPE_HASH_DEF, arg);
+            }
+            w_long(RHASH_SIZE(obj), arg);
+            rb_hash_foreach(obj, hash_each, (st_data_t)&c_arg);
+            if (!NIL_P(RHASH_IFNONE(obj))) {
+                w_object(RHASH_IFNONE(obj), arg, limit);
+            }
+            break;
+
+          case T_STRUCT:
+            w_class(TYPE_STRUCT, obj, arg, TRUE);
+            {
+                long len = RSTRUCT_LEN(obj);
+                VALUE mem;
+                long i;
+
+                w_long(len, arg);
+                mem = rb_struct_members(obj);
+                for (i=0; i<len; i++) {
+                    w_symbol(RARRAY_AREF(mem, i), arg);
+                    w_object(RSTRUCT_GET(obj, i), arg, limit);
+                }
+            }
+            break;
+
+          case T_OBJECT:
+            w_class(TYPE_OBJECT, obj, arg, TRUE);
+            w_objivar(obj, &c_arg);
+            break;
+
+          case T_DATA:
+            {
+                VALUE v;
+
+                if (!rb_obj_respond_to(obj, s_dump_data, TRUE)) {
+                    rb_raise(rb_eTypeError,
+                             "no _dump_data is defined for class %"PRIsVALUE,
+                             rb_obj_class(obj));
+                }
+                v = dump_funcall(arg, obj, s_dump_data, 0, 0);
+                w_class(TYPE_DATA, obj, arg, TRUE);
+                w_object(v, arg, limit);
+            }
+            break;
+
+          default:
+            rb_raise(rb_eTypeError, "can't dump %"PRIsVALUE,
+                     rb_obj_class(obj));
+            break;
+        }
+        RB_GC_GUARD(obj);
+    }
+    if (hasiv) {
+        w_ivar(hasiv, ivobj, encname, &c_arg);
+    }
+}
+
+static VALUE rb_ghash_dump(VALUE cb, VALUE port) {
+  int limit = -1;
+
+  struct dump_arg *arg;
+  VALUE wrapper;
+
+  wrapper = TypedData_Make_Struct(0, struct dump_arg, &dump_arg_data, arg);
+
+  arg->dest = 0;
+  arg->symbols = st_init_numtable();
+  arg->data    = rb_init_identtable();
+  arg->infection = 0;
+  arg->compat_tbl = 0;
+  arg->encodings = 0;
+  arg->str = rb_str_buf_new(0);
+
+  if (!NIL_P(port)) {
+      if (!rb_respond_to(port, "write")) {
+          io_needed();
+      }
+      arg->dest = port;
+      dump_check_funcall(arg, port, s_binmode, 0, 0);
+  }
+  else {
+      port = arg->str;
+  }
+
+  w_byte(MARSHAL_MAJOR, arg);
+  w_byte(MARSHAL_MINOR, arg);
+
+  w_object(cb, arg, limit);
+
+  if (arg->dest) {
+      rb_io_write(arg->dest, arg->str);
+      rb_str_resize(arg->str, 0);
+  }
+  clear_dump_arg(arg);
+  RB_GC_GUARD(wrapper);
+
+  return port;
+}
+
 static VALUE rb_ghash_clear(VALUE cb) {
   RCallback* incoming = GetCallbackStruct(cb);
   incoming->hash_map->clear();
@@ -306,24 +1347,24 @@ static VALUE rb_ghash_each(VALUE cb) {
     for(<%= type %>_hash_map< <%= key_type %>, <%= value_type %> <%= extra_hash_params %> >::iterator it = incoming->hash_map->begin(); it != incoming->hash_map->end(); ++it) {
       rb_yield_values(2, <%= convert_keys_to_ruby %>(it->first), <%= convert_values_to_ruby %>(it->second));
     }
-    return cb;  
+    return cb;
 }
-  
+
 static VALUE rb_ghash_values(VALUE cb) {
     RCallback* incoming = GetCallbackStruct(cb);
     VALUE out = rb_ary_new2(incoming->hash_map->size());
      for(<%= type %>_hash_map< <%= key_type %>, <%= value_type %> <%= extra_hash_params %>  >::iterator it = incoming->hash_map->begin(); it != incoming->hash_map->end(); ++it) {
       rb_ary_push(out, <%= convert_values_to_ruby %>(it->second));
-    } 
+    }
     return out;
 }
-  
+
 static VALUE rb_ghash_keys(VALUE cb) {
     RCallback* incoming = GetCallbackStruct(cb);
     VALUE out = rb_ary_new2(incoming->hash_map->size());
      for(<%= type %>_hash_map< <%= key_type %>, <%= value_type %> <%= extra_hash_params %> >::iterator it = incoming->hash_map->begin(); it != incoming->hash_map->end(); ++it) {
       rb_ary_push(out, <%= convert_keys_to_ruby %>(it->first));
-    } 
+    }
     return out;
 }
 
@@ -332,12 +1373,12 @@ static VALUE rb_ghash_keys(VALUE cb) {
 
 static VALUE rb_ghash_combination_2(VALUE cb) {
     RCallback* incoming = GetCallbackStruct(cb);
-    
+
      for(<%= type %>_hash_map< <%= key_type %>, <%= value_type %> <%= extra_hash_params %> >::iterator it = incoming->hash_map->begin(); it != incoming->hash_map->end(); ++it) {
-       
+
        <%= type %>_hash_map< <%= key_type %>, <%= value_type %> <%= extra_hash_params %> >::iterator next = it;
        ++next; // advance it
-       
+
        while(next != incoming->hash_map->end()) {
          rb_yield_values(2, <%= convert_keys_to_ruby %>(it->first), <%= convert_keys_to_ruby %>(next->first));
          ++next;
@@ -348,33 +1389,50 @@ static VALUE rb_ghash_combination_2(VALUE cb) {
 
 
 void init_<%= type %>_<%= english_key_type %>_to_<%= english_value_type %>() {
-  
+
     VALUE rb_cGoogleHashLocal;
-    <% class_name = "GoogleHash#{type.capitalize + english_key_type.capitalize}To#{english_value_type.capitalize}" %>
     rb_cGoogleHashLocal = rb_define_class("<%= class_name %>", rb_cObject);
 
-    rb_define_alloc_func(rb_cGoogleHashLocal, callback_alloc); // I guess it calls this for us, pre initialize... 
+    rb_define_alloc_func(rb_cGoogleHashLocal, callback_alloc); // I guess it calls this for us, pre initialize...
 
-    rb_define_method(rb_cGoogleHashLocal, "initialize", RUBY_METHOD_FUNC(rb_mri_hash_new), 0); 
-    rb_define_method(rb_cGoogleHashLocal, "[]=", RUBY_METHOD_FUNC(rb_ghash_set), 2); 
-    rb_define_method(rb_cGoogleHashLocal, "[]", RUBY_METHOD_FUNC(rb_ghash_get_value), 1); 
-    rb_define_method(rb_cGoogleHashLocal, "each", RUBY_METHOD_FUNC(rb_ghash_each), 0);	
-    rb_define_method(rb_cGoogleHashLocal, "each_pair", RUBY_METHOD_FUNC(rb_ghash_each), 0);	
-    rb_define_method(rb_cGoogleHashLocal, "values", RUBY_METHOD_FUNC(rb_ghash_values), 0); 
-    rb_define_method(rb_cGoogleHashLocal, "keys", RUBY_METHOD_FUNC(rb_ghash_keys), 0); 
+    rb_define_method(rb_cGoogleHashLocal, "initialize", RUBY_METHOD_FUNC(rb_mri_hash_new), 0);
+    rb_define_method(rb_cGoogleHashLocal, "[]=", RUBY_METHOD_FUNC(rb_ghash_set), 2);
+    rb_define_method(rb_cGoogleHashLocal, "[]", RUBY_METHOD_FUNC(rb_ghash_get_value), 1);
+    rb_define_method(rb_cGoogleHashLocal, "each", RUBY_METHOD_FUNC(rb_ghash_each), 0);
+    rb_define_method(rb_cGoogleHashLocal, "each_pair", RUBY_METHOD_FUNC(rb_ghash_each), 0);
+    rb_define_method(rb_cGoogleHashLocal, "values", RUBY_METHOD_FUNC(rb_ghash_values), 0);
+    rb_define_method(rb_cGoogleHashLocal, "keys", RUBY_METHOD_FUNC(rb_ghash_keys), 0);
     rb_define_method(rb_cGoogleHashLocal, "has_key?", RUBY_METHOD_FUNC(rb_ghash_get_present), 1);
     rb_define_method(rb_cGoogleHashLocal, "delete", RUBY_METHOD_FUNC(rb_ghash_delete), 1);
-    rb_define_method(rb_cGoogleHashLocal, "clear", RUBY_METHOD_FUNC(rb_ghash_clear), 0);	
+    rb_define_method(rb_cGoogleHashLocal, "clear", RUBY_METHOD_FUNC(rb_ghash_clear), 0);
     rb_define_method(rb_cGoogleHashLocal, "key?", RUBY_METHOD_FUNC(rb_ghash_get_present), 1);
     rb_define_method(rb_cGoogleHashLocal, "member?", RUBY_METHOD_FUNC(rb_ghash_get_present), 1);
     rb_define_method(rb_cGoogleHashLocal, "include?", RUBY_METHOD_FUNC(rb_ghash_get_present), 1);
-    rb_define_method(rb_cGoogleHashLocal, "keys_combination_2", RUBY_METHOD_FUNC(rb_ghash_combination_2), 0); 
+    rb_define_method(rb_cGoogleHashLocal, "keys_combination_2", RUBY_METHOD_FUNC(rb_ghash_combination_2), 0);
     rb_define_method(rb_cGoogleHashLocal, "length", RUBY_METHOD_FUNC(rb_ghash_size), 0);
     rb_define_method(rb_cGoogleHashLocal, "size", RUBY_METHOD_FUNC(rb_ghash_size), 0);
+    rb_define_method(rb_cGoogleHashLocal, "dump_as_hash", RUBY_METHOD_FUNC(rb_ghash_dump), 1);
+    rb_define_method(rb_cGoogleHashLocal, "dump_obj", RUBY_METHOD_FUNC(w_object), 2);
+
+    #undef rb_intern
+    #define rb_intern(str) rb_intern_const(str)
+
+    set_id(s_dump);
+    set_id(s_load);
+    set_id(s_mdump);
+    set_id(s_mload);
+    set_id(s_dump_data);
+    set_id(s_load_data);
+    set_id(s_alloc);
+    set_id(s_call);
+    set_id(s_getbyte);
+    set_id(s_read);
+    set_id(s_write);
+    set_id(s_binmode);
+
     // add a higher quality #inspect...
     rb_eval_string("class <%= class_name %>;def inspect;all = '<%= class_name %> {'; join = []; self.each{|k, v| join << (k.to_s + '=>' + v.to_s)}; all << join.join(',') << '}'; end; end");
     id_eql = rb_intern("eql?");
     id_hash = rb_intern("hash");
-  } 
+  }
 }
-
