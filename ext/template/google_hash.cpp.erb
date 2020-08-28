@@ -1315,7 +1315,7 @@ static VALUE rb_ghash_dump(VALUE cb, VALUE port) {
   arg->str = rb_str_buf_new(0);
 
   if (!NIL_P(port)) {
-      if (!rb_respond_to(port, "write")) {
+      if (!rb_respond_to(port, s_write)) {
           io_needed();
       }
       arg->dest = port;

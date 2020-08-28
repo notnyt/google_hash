@@ -27,3 +27,9 @@ a = GoogleHashSparseLongToRuby.new
 a[1234] = GoogleHashSparseLongToLong.new
 a[1234][5678] = 1
 puts Marshal.load(a.dump_as_hash(nil)).inspect
+
+f = File.open("test.dump", "w")
+a.dump_as_hash(f)
+f.close
+
+puts Marshal.load(open("test.dump").read).inspect
